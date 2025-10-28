@@ -12,7 +12,9 @@ services:
     restart: unless-stopped
 
   frontend:
-    image: node:latest
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
     working_dir: /app
     volumes:
       - ./frontend:/app
