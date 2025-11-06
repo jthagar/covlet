@@ -10,7 +10,3 @@
     --color-green: green;
     ---default-font-family: 'Nunito', sans-serif;
 }
-
-navbar {
-color: var(--color-mint-500);
-}

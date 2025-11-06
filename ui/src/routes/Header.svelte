@@ -12,7 +12,7 @@
 
 <header>
 	<div class="min-h-full">
-		<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
+		<nav class="navbar navbar-expand-lg navbar-dark bg-indigo-800 bg-dark">
 			<div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
 				<div class="flex h-16 items-center justify-between">
 					<div class="flex items-center">
