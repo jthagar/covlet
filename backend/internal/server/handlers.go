@@ -233,7 +233,7 @@ func handleRender(c *fiber.Ctx) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "template parse: "+err.Error())
 	}
-	data := templatevars.ApplyOverrides(req.Resume, req.Overrides)
+	data := templatevars.ResumeTemplateData(req.Resume, req.Overrides)
 	out, err := render.Render(t, data)
 	if err != nil {
 		return fiber.NewError(fiber.StatusBadRequest, "template execute: "+err.Error())

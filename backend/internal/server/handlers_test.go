@@ -65,6 +65,30 @@ func TestHandleRender(t *testing.T) {
 	}
 }
 
+func TestHandleRender_DynamicOverride(t *testing.T) {
+	t.Setenv("COVLET_HOME", t.TempDir())
+	app := New()
+	payload := map[string]interface{}{
+		"template":  "Role: {{ .RoleHint }} at {{ .CompanyToApplyTo }}",
+		"resume":    config.Resume{CompanyToApplyTo: "Acme"},
+		"overrides": map[string]string{"RoleHint": "Engineer"},
+	}
+	raw, _ := json.Marshal(payload)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/render", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	out, _ := io.ReadAll(resp.Body)
+	if string(out) != "Role: Engineer at Acme" {
+		t.Fatalf("got %q", out)
+	}
+}
+
 func TestHandleExportPDF(t *testing.T) {
 	t.Setenv("COVLET_HOME", t.TempDir())
 	app := New()

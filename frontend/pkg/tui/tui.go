@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/jthagar/covlet/backend/pkg/config"
 	"github.com/jthagar/covlet/frontend/pkg/client"
+	"github.com/jthagar/covlet/pkg/tplparse"
 )
 
 // Run starts the Bubble Tea UI.
@@ -41,7 +42,7 @@ func Run(apiURL string, resume config.Resume) error {
 	nf.CharLimit = 256
 
 	ed := textarea.New()
-	ed.Placeholder = "Select a template or paste content. Tab: list/editor · Ctrl+S save · Ctrl+R render · Ctrl+P PDF · Ctrl+O overrides"
+	ed.Placeholder = "Use {{ .Name }} style fields for dynamic values (right panel). Tab cycles panes. Ctrl+S / Ctrl+R / Ctrl+O / Ctrl+P"
 	ed.ShowLineNumbers = true
 	ed.Prompt = ""
 	ed.Focus()
@@ -59,8 +60,9 @@ func Run(apiURL string, resume config.Resume) error {
 		overrideRo:   or,
 		newFile:      nf,
 		overrideFocus: 0,
+		focusZone:    1, // 0=list, 1=editor, 2=preview
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -73,6 +75,14 @@ func defaultDownloads() string {
 	return filepath.Join(h, "Downloads")
 }
 
+// listBlockLines matches the list section height in View (header + rows or empty hint).
+func listBlockLines(files []string) int {
+	if len(files) == 0 {
+		return 2
+	}
+	return 1 + min(6, len(files))
+}
+
 type screen int
 
 const (
@@ -83,6 +93,92 @@ const (
 	screenDeleteConfirm
 )
 
+// layoutBodyChrome is lines above the editor inner + between panes + borders, excluding the footer.
+// footerReserve(screen) adds status/help or a fixed modal band so total chrome matches the View.
+const layoutBodyChrome = 11
+
+func footerReserve(s screen) int {
+	switch s {
+	case screenSavePDF, screenOverrides, screenNewFile, screenDeleteConfirm:
+		return 10
+	default:
+		return 3
+	}
+}
+
+func previewLineCount(text string) int {
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return 1
+	}
+	return strings.Count(text, "\n") + 1
+}
+
+func maxPreviewCap(avail int) int {
+	minEd, minPv := 6, 4
+	if avail < 2 {
+		return 1
+	}
+	if avail <= minEd+minPv {
+		return max(1, avail-max(1, avail/2))
+	}
+	ed := max(minEd, avail*45/100)
+	pv := avail - ed
+	if pv < minPv {
+		pv = minPv
+		ed = avail - pv
+		if ed < minEd {
+			ed = minEd
+			pv = avail - ed
+			if pv < 1 {
+				pv = 1
+			}
+		}
+	}
+	return pv
+}
+
+// layoutCompute splits vertical space: editor grows when preview needs fewer lines.
+// Preview height grows with content up to maxPreviewCap (same cap as the old fixed split).
+func layoutCompute(termHeight, termWidth int, files []string, previewLines int, s screen, hasVars bool) (edInnerH, pvInnerH, editorTextW, varsColW int) {
+	L := listBlockLines(files)
+	avail := termHeight - layoutBodyChrome - L - footerReserve(s)
+	if avail < 2 {
+		edInnerH, pvInnerH = 1, 1
+	} else {
+		maxCap := maxPreviewCap(avail)
+		minPv := 3
+		lines := max(1, previewLines)
+		pvInnerH = min(maxCap, max(minPv, lines))
+		edInnerH = avail - pvInnerH
+		minEd := 6
+		if edInnerH < minEd {
+			need := minEd - edInnerH
+			pvInnerH = max(minPv, pvInnerH-need)
+			edInnerH = avail - pvInnerH
+		}
+	}
+	contentW := max(20, termWidth-4)
+	varsColW = 0
+	if hasVars {
+		varsColW = min(38, max(22, termWidth/4))
+		if varsColW >= contentW-12 {
+			varsColW = max(18, contentW/5)
+		}
+	}
+	editorTextW = contentW - varsColW
+	if hasVars {
+		editorTextW -= 1
+	}
+	editorTextW = max(20, editorTextW)
+	return edInnerH, pvInnerH, editorTextW, varsColW
+}
+
+type tplVarRow struct {
+	Name  string
+	Input textinput.Model
+}
+
 type model struct {
 	cl     *client.Client
 	resume config.Resume
@@ -90,7 +186,7 @@ type model struct {
 	files     []string
 	sel       int
 	path      string
-	focusList bool
+	focusZone int // 0=list, 1=editor, 2=vars (if any), 3=preview; else 2=preview
 
 	editor       textarea.Model
 	preview      viewport.Model
@@ -107,6 +203,13 @@ type model struct {
 
 	pdfData []byte
 	pdfName string
+
+	tplRows       []tplVarRow
+	tplVarSig     string
+	tplVarFocus   int
+	varsScroll    int
+	layoutEditorW int
+	layoutVarsW   int
 
 	status string
 	width  int
@@ -152,6 +255,150 @@ type deleteMsg struct {
 	err error
 }
 
+func (m model) tplVarsEnabled() bool {
+	if strings.TrimSpace(m.path) == "" {
+		return true
+	}
+	return strings.HasSuffix(strings.ToLower(m.path), ".tpl")
+}
+
+func (m model) varsPanelActive() bool {
+	return len(m.tplRows) > 0 && m.tplVarsEnabled()
+}
+
+func (m model) maxFocusZone() int {
+	if m.varsPanelActive() {
+		return 3
+	}
+	return 2
+}
+
+func (m model) normalizeFocusZone() model {
+	if mz := m.maxFocusZone(); m.focusZone > mz {
+		m.focusZone = mz
+	}
+	return m
+}
+
+func defaultResumeField(r config.Resume, name string) string {
+	switch name {
+	case "Name":
+		return r.Name
+	case "Email":
+		return r.Email
+	case "Phone":
+		return r.Phone
+	case "Address":
+		return r.Address
+	case "Website":
+		return r.Website
+	case "Github":
+		return r.Github
+	case "CompanyToApplyTo":
+		return r.CompanyToApplyTo
+	case "RoleToApplyTo":
+		return r.RoleToApplyTo
+	default:
+		return ""
+	}
+}
+
+func (m model) rebuildTplRowsFromEditor() (model, bool) {
+	names := tplparse.ParseTopLevelVars(m.editor.Value())
+	sig := strings.Join(names, "\x00")
+	if sig == m.tplVarSig && len(names) == len(m.tplRows) {
+		return m, false
+	}
+	prev := map[string]string{}
+	for _, row := range m.tplRows {
+		prev[row.Name] = row.Input.Value()
+	}
+	m.tplVarSig = sig
+	m.tplRows = nil
+	for _, name := range names {
+		ti := textinput.New()
+		ti.Placeholder = "value"
+		ti.CharLimit = 768
+		if v, ok := prev[name]; ok {
+			ti.SetValue(v)
+		} else {
+			ti.SetValue(defaultResumeField(m.resume, name))
+		}
+		m.tplRows = append(m.tplRows, tplVarRow{Name: name, Input: ti})
+	}
+	if len(m.tplRows) == 0 {
+		m.tplVarFocus = 0
+	} else if m.tplVarFocus >= len(m.tplRows) {
+		m.tplVarFocus = len(m.tplRows) - 1
+	}
+	m = m.ensureVarsScroll()
+	return m, true
+}
+
+func (m model) ensureVarsScroll() model {
+	if len(m.tplRows) == 0 {
+		m.varsScroll = 0
+		return m
+	}
+	if m.tplVarFocus < m.varsScroll {
+		m.varsScroll = m.tplVarFocus
+	}
+	// Match varsPanelView: one line is reserved for the hint; rest are field rows.
+	vis := max(1, m.editor.Height()-1)
+	if m.tplVarFocus >= m.varsScroll+vis {
+		m.varsScroll = m.tplVarFocus - vis + 1
+	}
+	if m.varsScroll < 0 {
+		m.varsScroll = 0
+	}
+	return m
+}
+
+func (m model) relayout() model {
+	if m.width <= 0 || m.height <= 0 {
+		return m
+	}
+	pl := previewLineCount(m.previewText)
+	hasVars := m.varsPanelActive()
+	edH, pvH, edW, vW := layoutCompute(m.height, m.width, m.files, pl, m.screen, hasVars)
+	m.layoutEditorW = edW
+	m.layoutVarsW = vW
+	m.editor.SetWidth(edW)
+	m.editor.SetHeight(max(1, edH))
+	m.preview.Width = max(20, m.width-4)
+	m.preview.Height = max(1, pvH)
+	if hasVars {
+		inW := vW - 4
+		if inW < 6 {
+			inW = 6
+		}
+		for i := range m.tplRows {
+			ti := m.tplRows[i].Input
+			ti.Width = inW
+			m.tplRows[i].Input = ti
+		}
+	}
+	m = m.normalizeFocusZone()
+	m = m.syncAllFocus()
+	return m
+}
+
+func (m model) syncAllFocus() model {
+	if m.focusZone == 1 {
+		m.editor.Focus()
+	} else {
+		m.editor.Blur()
+	}
+	for i := range m.tplRows {
+		if m.varsPanelActive() && m.focusZone == 2 && i == m.tplVarFocus {
+			m.tplRows[i].Input.Focus()
+		} else {
+			m.tplRows[i].Input.Blur()
+		}
+	}
+	return m
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.Sequence(m.healthCmd(), m.refreshFilesCmd)
 }
@@ -173,18 +420,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		half := m.height / 2
-		if half < 6 {
-			half = 6
-		}
-		top := m.height - half - 6
-		if top < 8 {
-			top = 8
-		}
-		m.editor.SetWidth(max(20, m.width-4))
-		m.editor.SetHeight(max(6, top))
-		m.preview.Width = max(20, m.width-4)
-		m.preview.Height = max(4, half)
+		m, _ = m.rebuildTplRowsFromEditor()
+		m = m.relayout()
 		var eCmd, pCmd tea.Cmd
 		m.editor, eCmd = m.editor.Update(msg)
 		m.preview, pCmd = m.preview.Update(msg)
@@ -209,6 +446,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.status == "" || strings.HasPrefix(m.status, "list:") {
 			m.status = fmt.Sprintf("%d template(s)", len(m.files))
 		}
+		if m.width > 0 && m.height > 0 {
+			m, _ = m.rebuildTplRowsFromEditor()
+			m = m.relayout()
+		}
 		return m, nil
 
 	case loadedMsg:
@@ -219,6 +460,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.path = msg.path
 		m.editor.SetValue(string(msg.content))
 		m.status = "loaded " + m.path
+		m, _ = m.rebuildTplRowsFromEditor()
+		m = m.relayout()
 		return m, nil
 
 	case createFileMsg:
@@ -226,6 +469,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.newFile.Blur()
 		if msg.err != nil {
 			m.status = "create: " + msg.err.Error()
+			m = m.relayout()
 			return m, nil
 		}
 		m.status = "created " + msg.path
@@ -237,6 +481,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingDelete = ""
 		if msg.err != nil {
 			m.status = "delete: " + msg.err.Error()
+			m = m.relayout()
 			return m, nil
 		}
 		m.status = "deleted " + rel
@@ -244,6 +489,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.path = ""
 			m.editor.SetValue("")
 		}
+		m, _ = m.rebuildTplRowsFromEditor()
+		m = m.relayout()
 		return m, m.refreshFilesCmd
 
 	case renderResultMsg:
@@ -254,6 +501,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.previewText = msg.text
 		m.preview.SetContent(msg.text)
 		m.status = "rendered"
+		m = m.relayout()
 		return m, nil
 
 	case saveResultMsg:
@@ -268,6 +516,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status = "pdf: " + msg.err.Error()
 			m.screen = screenEdit
+			m = m.relayout()
 			return m, nil
 		}
 		m.pdfData = msg.data
@@ -278,6 +527,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.savePath.Focus()
 		m.status = "PDF ready — Enter directory to save, Esc cancel"
+		m = m.relayout()
 		return m, textinput.Blink
 
 	case tea.KeyMsg:
@@ -296,16 +546,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c":
 			return m, tea.Quit
 		case "tab":
-			m.focusList = !m.focusList
-			if m.focusList {
-				m.editor.Blur()
-			} else {
-				m.editor.Focus()
-			}
+			nz := m.maxFocusZone() + 1
+			m.focusZone = (m.focusZone + 1) % nz
+			m = m.syncAllFocus()
 			return m, nil
 		}
 
-		if m.focusList {
+		if m.focusZone == 0 {
 			switch msg.String() {
 			case "up", "k":
 				if m.sel > 0 {
@@ -328,6 +575,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.newFile.SetValue("")
 				m.newFile.Focus()
 				m.status = "New file — Enter name, Esc cancel"
+				m = m.relayout()
 				return m, textinput.Blink
 			case "d":
 				if len(m.files) == 0 || m.sel < 0 || m.sel >= len(m.files) {
@@ -336,9 +584,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingDelete = m.files[m.sel]
 				m.screen = screenDeleteConfirm
 				m.status = fmt.Sprintf("Delete %q? (y/N)", m.pendingDelete)
+				m = m.relayout()
 				return m, nil
 			}
 			return m, nil
+		}
+
+		if m.varsPanelActive() && m.focusZone == 2 {
+			switch msg.String() {
+			case "ctrl+s":
+				return m, m.enqueueSave()
+			case "ctrl+r":
+				return m, m.enqueueRender()
+			case "ctrl+p":
+				return m, m.enqueueExportPDF()
+			case "ctrl+o":
+				m.screen = screenOverrides
+				m.overrideFocus = 0
+				m.overrideRo.Blur()
+				m.overrideCo.Focus()
+				m.status = "Overrides — Tab switch field, Enter/Esc close"
+				m = m.relayout()
+				return m, textinput.Blink
+			case "up", "k":
+				if m.tplVarFocus > 0 {
+					m.tplVarFocus--
+					m = m.ensureVarsScroll()
+					m = m.syncAllFocus()
+				}
+				return m, nil
+			case "down", "j":
+				if m.tplVarFocus < len(m.tplRows)-1 {
+					m.tplVarFocus++
+					m = m.ensureVarsScroll()
+					m = m.syncAllFocus()
+				}
+				return m, nil
+			default:
+				row := m.tplRows[m.tplVarFocus]
+				var cmd tea.Cmd
+				row.Input, cmd = row.Input.Update(msg)
+				m.tplRows[m.tplVarFocus] = row
+				return m, cmd
+			}
+		}
+
+		if m.focusZone == m.maxFocusZone() {
+			switch msg.String() {
+			case "ctrl+s":
+				return m, m.enqueueSave()
+			case "ctrl+r":
+				return m, m.enqueueRender()
+			case "ctrl+p":
+				return m, m.enqueueExportPDF()
+			case "ctrl+o":
+				m.screen = screenOverrides
+				m.overrideFocus = 0
+				m.overrideRo.Blur()
+				m.overrideCo.Focus()
+				m.status = "Overrides — Tab switch field, Enter/Esc close"
+				m = m.relayout()
+				return m, textinput.Blink
+			default:
+				var cmd tea.Cmd
+				m.preview, cmd = m.preview.Update(msg)
+				return m, cmd
+			}
 		}
 
 		switch msg.String() {
@@ -354,11 +665,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.overrideRo.Blur()
 			m.overrideCo.Focus()
 			m.status = "Overrides — Tab switch field, Enter/Esc close"
+			m = m.relayout()
 			return m, textinput.Blink
 		}
 
 		var cmd tea.Cmd
 		m.editor, cmd = m.editor.Update(msg)
+		m2, changed := m.rebuildTplRowsFromEditor()
+		m = m2
+		if changed {
+			m = m.relayout()
+		}
+		return m, cmd
+
+	case tea.MouseMsg:
+		if m.screen != screenEdit {
+			return m, nil
+		}
+		if m.focusZone != m.maxFocusZone() {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.preview, cmd = m.preview.Update(msg)
 		return m, cmd
 	}
 
@@ -375,6 +703,7 @@ func (m model) updateSavePDF(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.savePath.Blur()
 		m.pdfData = nil
 		m.status = "save cancelled"
+		m = m.relayout()
 		return m, nil
 	case "enter":
 		return m.finishSavePDF()
@@ -391,6 +720,7 @@ func (m model) updateOverrides(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.overrideCo.Blur()
 		m.overrideRo.Blur()
 		m.status = "overrides saved"
+		m = m.relayout()
 		return m, nil
 	case "tab":
 		if m.overrideFocus == 0 {
@@ -419,6 +749,7 @@ func (m model) updateNewFile(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenEdit
 		m.newFile.Blur()
 		m.status = "cancelled"
+		m = m.relayout()
 		return m, nil
 	case "enter":
 		name := strings.TrimSpace(m.newFile.Value())
@@ -441,6 +772,7 @@ func (m model) updateDeleteConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenEdit
 		m.pendingDelete = ""
 		m.status = "cancelled"
+		m = m.relayout()
 		return m, nil
 	}
 	return m, nil
@@ -472,6 +804,11 @@ func (m model) enqueueSave() tea.Cmd {
 
 func (m model) renderOverrides() map[string]string {
 	o := make(map[string]string)
+	for _, row := range m.tplRows {
+		if v := strings.TrimSpace(row.Input.Value()); v != "" {
+			o[row.Name] = v
+		}
+	}
 	if v := strings.TrimSpace(m.overrideCo.Value()); v != "" {
 		o["CompanyToApplyTo"] = v
 	}
@@ -540,6 +877,7 @@ func (m model) finishSavePDF() (tea.Model, tea.Cmd) {
 	m.savePath.Blur()
 	m.pdfData = nil
 	m.status = "wrote " + out
+	m = m.relayout()
 	return m, nil
 }
 
@@ -568,7 +906,102 @@ func (m model) loadFileCmd(rel string) tea.Cmd {
 var (
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("62"))
 	boxStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder())
+	dimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
+
+// varsPanelView returns exactly targetLines rows so the vars box matches the editor
+// inner height; otherwise JoinHorizontal misaligns rounded borders when the column is shorter.
+func (m model) varsPanelView(targetLines, contentW int) string {
+	if len(m.tplRows) == 0 || contentW < 8 {
+		return ""
+	}
+	if targetLines < 1 {
+		targetLines = 1
+	}
+	labelW := min(12, max(6, contentW/3))
+	inpW := contentW - labelW - 2
+	if inpW < 4 {
+		inpW = 4
+	}
+	hint := dimStyle.Render(truncate("↑/↓ field · Tab next pane", contentW))
+	if targetLines == 1 {
+		return hint
+	}
+	dataLines := targetLines - 1
+	end := min(len(m.tplRows), m.varsScroll+dataLines)
+	var lines []string
+	for i := m.varsScroll; i < end; i++ {
+		row := m.tplRows[i]
+		prefix := " "
+		if i == m.tplVarFocus && m.varsPanelActive() && m.focusZone == 2 {
+			prefix = ">"
+		}
+		label := truncate(row.Name+":", labelW)
+		line := lipgloss.JoinHorizontal(lipgloss.Top,
+			lipgloss.NewStyle().Width(1).Render(prefix),
+			lipgloss.NewStyle().Width(labelW).Render(label),
+			row.Input.View(),
+		)
+		lines = append(lines, truncate(line, contentW))
+	}
+	for len(lines) < dataLines {
+		lines = append(lines, "")
+	}
+	if len(lines) > dataLines {
+		lines = lines[:dataLines]
+	}
+	lines = append(lines, hint)
+	for len(lines) < targetLines {
+		lines = append(lines, "")
+	}
+	if len(lines) > targetLines {
+		lines = lines[:targetLines]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m model) renderFooter() string {
+	h := footerReserve(m.screen)
+	var lines []string
+	switch m.screen {
+	case screenEdit:
+		help := "Tab panes · j/k list · Enter · r · n · d · Ctrl+S · Ctrl+R · Ctrl+O resume · Ctrl+P PDF · Ctrl+C quit"
+		if strings.TrimSpace(m.previewText) != "" {
+			help += fmt.Sprintf(" · preview %.0f%%", m.preview.ScrollPercent()*100)
+		}
+		lines = []string{m.status, help}
+	case screenSavePDF:
+		lines = []string{
+			titleStyle.Render("Save PDF"),
+			"Directory: " + m.savePath.View(),
+			"(Enter to save, Esc cancel)",
+		}
+	case screenOverrides:
+		lines = []string{
+			titleStyle.Render("Overrides (render / PDF)"),
+			"Company: " + m.overrideCo.View(),
+			"Role:    " + m.overrideRo.View(),
+			"(Enter or Esc to close, Tab switch)",
+		}
+	case screenNewFile:
+		lines = []string{
+			titleStyle.Render("New template"),
+			"Filename: " + m.newFile.View(),
+		}
+	case screenDeleteConfirm:
+		lines = []string{
+			titleStyle.Render("Confirm delete"),
+			"(y to confirm, n or Esc cancel)",
+		}
+	}
+	for len(lines) < h {
+		lines = append(lines, "")
+	}
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	return strings.Join(lines, "\n")
+}
 
 func (m model) View() string {
 	if m.width == 0 {
@@ -586,7 +1019,7 @@ func (m model) View() string {
 	}
 
 	listLines := min(6, max(1, len(m.files)))
-	if m.focusList {
+	if m.focusZone == 0 {
 		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("[list]") + "\n")
 	} else {
 		b.WriteString("[list — Tab to focus]\n")
@@ -609,32 +1042,37 @@ func (m model) View() string {
 		b.WriteString("  (no files — n new, or add under templates on server)\n")
 	}
 
-	b.WriteString("\neditor" + map[bool]string{true: " *", false: ""}[!m.focusList] + "\n")
-	b.WriteString(boxStyle.Width(w).Render(m.editor.View()) + "\n")
+	edStar := map[bool]string{true: " *", false: ""}[m.focusZone == 1]
+	b.WriteString("\neditor" + edStar)
+	if m.varsPanelActive() {
+		b.WriteString(dimStyle.Render("  │  ") + lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("{{…}} fields") +
+			map[bool]string{true: " *", false: ""}[m.focusZone == 2])
+	}
+	b.WriteString("\n")
 
-	b.WriteString("\npreview\n")
+	edW := m.layoutEditorW
+	vW := m.layoutVarsW
+	if edW == 0 && m.height > 0 {
+		has := len(m.tplRows) > 0 && m.tplVarsEnabled()
+		_, _, edW, vW = layoutCompute(m.height, m.width, m.files, previewLineCount(m.previewText), m.screen, has)
+	}
+	if m.varsPanelActive() && vW > 0 {
+		innerVars := vW - 2
+		if innerVars < 6 {
+			innerVars = 6
+		}
+		left := boxStyle.Width(edW).Render(m.editor.View())
+		right := boxStyle.Width(vW).Render(m.varsPanelView(m.editor.Height(), innerVars))
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right) + "\n")
+	} else {
+		b.WriteString(boxStyle.Width(w).Render(m.editor.View()) + "\n")
+	}
+
+	pvStar := map[bool]string{true: " *", false: ""}[m.focusZone == m.maxFocusZone()]
+	b.WriteString("\n\npreview" + pvStar + "\n")
 	b.WriteString(boxStyle.Width(w).Render(m.preview.View()) + "\n")
 
-	b.WriteString("\n" + m.status + "\n")
-	b.WriteString("Tab list/editor · j/k · Enter · r · n new · d delete · Ctrl+S · Ctrl+R · Ctrl+O overrides · Ctrl+P PDF · Ctrl+C quit\n")
-
-	switch m.screen {
-	case screenSavePDF:
-		b.WriteString("\n" + titleStyle.Render("Save PDF") + "\n")
-		b.WriteString("Directory: " + m.savePath.View() + "\n")
-		b.WriteString("(Enter to save, Esc cancel)\n")
-	case screenOverrides:
-		b.WriteString("\n" + titleStyle.Render("Overrides (render / PDF)") + "\n")
-		b.WriteString("Company: " + m.overrideCo.View() + "\n")
-		b.WriteString("Role:    " + m.overrideRo.View() + "\n")
-		b.WriteString("(Enter or Esc to close, Tab switch)\n")
-	case screenNewFile:
-		b.WriteString("\n" + titleStyle.Render("New template") + "\n")
-		b.WriteString("Filename: " + m.newFile.View() + "\n")
-	case screenDeleteConfirm:
-		b.WriteString("\n" + titleStyle.Render("Confirm delete") + "\n")
-		b.WriteString("(y to confirm, n or Esc cancel)\n")
-	}
+	b.WriteString("\n" + m.renderFooter() + "\n")
 
 	return b.String()
 }

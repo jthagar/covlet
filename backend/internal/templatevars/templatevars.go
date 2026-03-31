@@ -4,67 +4,45 @@ import (
 	"strings"
 
 	"github.com/jthagar/covlet/backend/pkg/config"
+	"github.com/jthagar/covlet/pkg/tplparse"
 )
 
 // ParseTopLevelVars extracts top-level variable names referenced as {{ .Name }} etc.
 func ParseTopLevelVars(s string) []string {
-	type void struct{}
-	seen := map[string]void{}
-	order := []string{}
-	i := 0
-	for i < len(s) {
-		start := strings.Index(s[i:], "{{")
-		if start < 0 {
-			break
-		}
-		start += i + 2
-		endRel := strings.Index(s[start:], "}}")
-		if endRel < 0 {
-			break
-		}
-		end := start + endRel
-		expr := s[start:end]
-		j := 0
-		for j < len(expr) && (expr[j] == ' ' || expr[j] == '\n' || expr[j] == '\t') {
-			j++
-		}
-		for j < len(expr) {
-			if expr[j] == '.' {
-				k := j + 1
-				if k < len(expr) && isIdentStart(expr[k]) {
-					startName := k
-					k++
-					for k < len(expr) && isIdentPart(expr[k]) {
-						k++
-					}
-					name := expr[startName:k]
-					if name != "" {
-						if _, ok := seen[name]; !ok {
-							seen[name] = void{}
-							order = append(order, name)
-						}
-					}
-				}
-			}
-			j++
-		}
+	return tplparse.ParseTopLevelVars(s)
+}
 
-		i = end + 2
+// ResumeTemplateData builds the data map passed to text/template.Execute. Overrides
+// (including keys not on Resume) are merged on top so {{ .Custom }} can be supplied
+// from the TUI.
+func ResumeTemplateData(r config.Resume, overrides map[string]string) map[string]interface{} {
+	out := map[string]interface{}{
+		"Name":             r.Name,
+		"Email":            r.Email,
+		"Phone":            r.Phone,
+		"Address":          r.Address,
+		"Website":          r.Website,
+		"Github":           r.Github,
+		"Education":        r.Education,
+		"Experience":       r.Experience,
+		"Skills":           r.Skills,
+		"Projects":         r.Projects,
+		"CompanyToApplyTo": r.CompanyToApplyTo,
+		"RoleToApplyTo":    r.RoleToApplyTo,
 	}
-	return order
-}
-
-func isIdentStart(b byte) bool {
-	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_'
-}
-
-func isIdentPart(b byte) bool {
-	return isIdentStart(b) || (b >= '0' && b <= '9')
+	for k, v := range overrides {
+		k = strings.TrimSpace(k)
+		if k == "" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // ApplyOverrides returns a copy of Resume with string fields overridden by the map.
 func ApplyOverrides(in config.Resume, overrides map[string]string) config.Resume {
-	if overrides == nil || len(overrides) == 0 {
+	if len(overrides) == 0 {
 		return in
 	}
 	out := in
