@@ -1,27 +1,9 @@
-version: '3.8'
-
 services:
-  backend:
+  covlet:
     build:
       context: .
       dockerfile: Dockerfile
     ports:
-      - "3000:3000"
+      - "8080:8080"
     environment:
-      - GO_ENV=development
-    restart: unless-stopped
-
-  frontend:
-    build:
-      context: ./ui
-      dockerfile: Dockerfile
-    working_dir: /app
-    volumes:
-      - ./frontend:/app
-    ports:
-      - "5173:5173"
-    environment:
-      - NODE_ENV=development
-    command: sh -c "npm install && npm run dev -- --host"
-    depends_on:
-      - backend
+      COVLET_LISTEN: ":8080"
